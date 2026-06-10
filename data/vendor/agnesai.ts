@@ -108,6 +108,7 @@ declare const zipImageResolution: (base64: string, w: number, h: number) => Prom
 declare const mergeImages: (base64Arr: string[], maxSize?: string) => Promise<string>;
 declare const urlToBase64: (url: string) => Promise<string>;
 declare const pollTask: (fn: () => Promise<PollResult>, interval?: number, timeout?: number) => Promise<PollResult>;
+declare const withGlobalLock: <T>(key: string, fn: () => Promise<T>) => Promise<T>;
 declare const createOpenAI: any;
 declare const createDeepSeek: any;
 declare const createZhipu: any;
@@ -265,6 +266,15 @@ const imageRequest = async (config: ImageConfig, model: ImageModel): Promise<str
   throw new Error(`图片生成失败: ${JSON.stringify(responseData)}`);
 };
 
+// 轮询队列：确保多任务时单线程遍历轮询，避免并发轮询造成资源浪费
+let pollQueue: Promise<any> = Promise.resolve();
+
+function enqueuePoll(fn: () => Promise<PollResult>, interval?: number, timeout?: number): Promise<PollResult> {
+  const p = pollQueue.then(() => pollTask(fn, interval, timeout));
+  pollQueue = p.catch(() => {});
+  return p;
+}
+
 const videoRequest = async (config: VideoConfig, model: VideoModel): Promise<string> => {
   if (!vendor.inputValues.apiKey) throw new Error("缺少API Key");
 
@@ -314,48 +324,88 @@ const videoRequest = async (config: VideoConfig, model: VideoModel): Promise<str
 
   logger(`开始提交视频生成任务，模型: ${model.modelName}, 时长: ${config.duration}s, 分辨率: ${config.resolution}`);
 
-  // 提交任务
-  const submitResp = await axios.post(`${baseUrl}/videos`, requestBody, {
-    headers: getHeaders(),
+  // 提交任务：跨任务串行 + 最多重试 10 次
+  const MAX_SUBMIT_ATTEMPTS = 10;
+  const taskId: string = await withGlobalLock<string>("agnesai:video:submit", async () => {
+    let lastError: any = null;
+    for (let attempt = 1; attempt <= MAX_SUBMIT_ATTEMPTS; attempt++) {
+      try {
+        const submitResp = await axios.post(`${baseUrl}/videos`, requestBody, {
+          headers: getHeaders(),
+        });
+        const id = submitResp.data?.id;
+        if (!id) {
+          throw new Error(`提交视频任务失败: ${JSON.stringify(submitResp.data)}`);
+        }
+        if (attempt > 1) logger(`第${attempt}次重试提交成功`);
+        return id as string;
+      } catch (e: any) {
+        lastError = e;
+        const msg = e?.response?.data ? JSON.stringify(e.response.data) : e?.message || String(e);
+        logger(`提交视频任务失败（第${attempt}/${MAX_SUBMIT_ATTEMPTS}次）：${msg}`);
+        if (attempt < MAX_SUBMIT_ATTEMPTS) {
+          // 指数退避：2s, 4s, 8s, ... 上限 30s
+          const delay = Math.min(2000 * Math.pow(2, attempt - 1), 30000);
+          await new Promise((r) => setTimeout(r, delay));
+        }
+      }
+    }
+    throw new Error(
+      `提交视频任务失败，已重试${MAX_SUBMIT_ATTEMPTS}次：${lastError?.response?.data ? JSON.stringify(lastError.response.data) : lastError?.message || String(lastError)}`,
+    );
   });
 
-  const taskId = submitResp.data.id;
-  if (!taskId) {
-    throw new Error(`提交视频任务失败: ${JSON.stringify(submitResp.data)}`);
-  }
   logger(`任务已提交，任务ID: ${taskId}`);
 
-  // 轮询等待结果
-  const result = await pollTask(
+  // 轮询等待结果（通过队列串行执行，多任务时不并发轮询）
+  const result = await enqueuePoll(
     async () => {
-      const queryResp = await axios.get(`${baseUrl}/videos/${taskId}`, {
-        headers: getHeaders(),
-      });
+      try {
+        const queryResp = await axios.get(`${baseUrl}/videos/${taskId}`, {
+          headers: getHeaders(),
+        });
 
-      const taskData = queryResp.data;
-      const status = taskData.status;
-      logger(`轮询中... 任务状态: ${status}`);
+        const taskData = queryResp.data;
+        const status = taskData.status;
+        logger(`轮询中... 任务状态: ${status}`);
 
-      if (status === "SUCCESS" || status === "completed") {
-        const videoUrl = taskData.url || taskData.data?.url || taskData.result?.url;
-        if (!videoUrl) {
-          return { completed: true, error: "任务完成但未获取到视频URL" };
+        if (status === "SUCCESS" || status === "completed") {
+          const videoUrl = taskData.url || taskData.data?.url || taskData.result?.url;
+          if (!videoUrl) {
+            return { completed: true, error: "任务完成但未获取到视频URL" };
+          }
+          return { completed: true, data: videoUrl };
         }
-        return { completed: true, data: videoUrl };
-      }
 
-      if (status === "FAILED" || status === "failed") {
-        const errorMsg = taskData.message || taskData.error || "视频生成失败";
-        return { completed: true, error: errorMsg };
-      }
+        if (status === "FAILED" || status === "failed") {
+          // taskData.message / taskData.error 可能是对象，需拍平为字符串避免 [object Object]
+          const raw = taskData.message ?? taskData.error ?? taskData.failure_reason;
+          let errorMsg: string;
+          if (raw == null) {
+            errorMsg = `视频生成失败: ${JSON.stringify(taskData)}`;
+          } else if (typeof raw === "string") {
+            errorMsg = raw;
+          } else if (typeof raw === "object") {
+            errorMsg = (raw as any).message || (raw as any).msg || (raw as any).reason || JSON.stringify(raw);
+          } else {
+            errorMsg = String(raw);
+          }
+          return { completed: true, error: errorMsg };
+        }
 
-      return { completed: false };
+        return { completed: false };
+      } catch (e: any) {
+        // axios 网络错误时把响应体也带上，避免吞掉服务端真实错误
+        const detail = e?.response?.data ? (typeof e.response.data === "string" ? e.response.data : JSON.stringify(e.response.data)) : "";
+        const msg = e?.message || String(e);
+        return { completed: false, error: detail ? `${msg} | ${detail}` : msg };
+      }
     },
-    5000,
-    600000,
+    60000,
+    172800000,
   );
 
-  if (result.error) throw new Error(result.error);
+  if (result.error) throw new Error(typeof result.error === "string" ? result.error : JSON.stringify(result.error));
   logger("视频生成完成，正在转换为Base64...");
   return await urlToBase64(result.data!);
 };

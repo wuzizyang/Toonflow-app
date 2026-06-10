@@ -40,6 +40,7 @@ export default function runCode(code: string, vendor?: Record<string, any>) {
     logger,
     jsonwebtoken,
     crypto,
+    withGlobalLock,
   };
   if (vendor !== undefined) {
     sandbox.vendor = vendor;
@@ -58,6 +59,23 @@ export default function runCode(code: string, vendor?: Record<string, any>) {
 }
 export function logger(logstring: any) {
   console.log("【VM】" + JSON.stringify(logstring));
+}
+
+/**
+ * 跨 VM 实例的命名串行锁。
+ * 不同 VM 沙盒共享 host 侧 lockMap，按 key 串行执行 fn。
+ * 用于需要全局节流/串行的场景（如视频任务提交）。
+ */
+const lockMap: Map<string, Promise<any>> = new Map();
+export async function withGlobalLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const prev = lockMap.get(key) || Promise.resolve();
+  const next = prev.then(fn, fn);
+  // 串行链上不让单次失败阻断后续任务
+  lockMap.set(
+    key,
+    next.catch(() => {}),
+  );
+  return next;
 }
 /**
  * 压缩图片，目标字节数不高于 size
